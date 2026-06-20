@@ -16,9 +16,9 @@ chunking with overlap preserves cross-paragraph context.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
-import pickle
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Protocol, Union, runtime_checkable
@@ -42,7 +42,7 @@ _B = 0.75
 # A book scope is one slug, an iterable of slugs, or None (corpus-wide).
 BookScope = Union[str, Iterable[str], None]
 
-_CACHE_VERSION = 2  # bump when chunking or index format changes
+_CACHE_VERSION = 3  # bump when chunking or index format changes (v3: pickle -> json)
 
 
 def tokenize(text: str) -> List[str]:
@@ -73,8 +73,9 @@ class _Chunk:
 class BookCorpus:
     """BM25 index over the `books/*/_combined.md` extractions.
 
-    Builds on first use, caches to disk keyed on the source files' mtimes plus the
-    chunking parameters, and answers `search()` queries. Implements `Retriever`.
+    Builds on first use, caches to disk (JSON) keyed on the source files' content
+    hash plus the chunking parameters, and answers `search()` queries. Implements
+    `Retriever`.
     """
 
     def __init__(
@@ -84,6 +85,16 @@ class BookCorpus:
         overlap: int = 40,
         cache: bool = True,
     ) -> None:
+        # Guard the chunking geometry up front. overlap >= chunk_words collapses the
+        # window step to 1 (see _chunk), which silently builds a near-quadratic,
+        # massively duplicated index and skews the idf statistics. Fail loud instead.
+        if chunk_words < 1:
+            raise ValueError(f"chunk_words must be >= 1, got {chunk_words}")
+        if overlap < 0 or overlap >= chunk_words:
+            raise ValueError(
+                f"overlap must satisfy 0 <= overlap < chunk_words; got overlap={overlap}, "
+                f"chunk_words={chunk_words}"
+            )
         self.books_dir = Path(books_dir) if books_dir else Path(__file__).parent / "books"
         self.chunk_words = chunk_words
         self.overlap = overlap
@@ -141,7 +152,9 @@ class BookCorpus:
         n = len(chunks)
         if n == 0:
             raise ValueError("corpus produced zero indexable chunks")
-        # BM25+ idf, floored at a small positive value so common terms still rank.
+        # BM25+ idf: the `1 +` inside the log keeps idf strictly positive (classic
+        # BM25 idf goes negative for terms in most documents), so very common terms
+        # still contribute a small positive weight rather than zero or negative.
         self._idf = {
             term: math.log(1 + (n - d + 0.5) / (d + 0.5)) for term, d in df.items()
         }
@@ -161,11 +174,10 @@ class BookCorpus:
             if p:
                 words.extend(p.split(" "))
         chunks: List[str] = []
-        step = max(1, self.chunk_words - self.overlap)
+        # __init__ guarantees overlap < chunk_words, so step >= 1 without clamping.
+        step = self.chunk_words - self.overlap
         for start in range(0, len(words), step):
             window = words[start : start + self.chunk_words]
-            if not window:
-                break
             chunks.append(" ".join(window))
             if start + self.chunk_words >= len(words):
                 break
@@ -243,17 +255,31 @@ class BookCorpus:
         return score
 
     # ------------------------------------------------------------------ #
-    # Cache (pickle keyed on source mtimes + params)
+    # Cache (JSON keyed on source content + params)
     # ------------------------------------------------------------------ #
+    #
+    # Deliberately JSON, not pickle. The cache lives at `books_dir/.rag_cache.json`,
+    # a path that is writable by design (the program writes it) and user-suppliable
+    # (BookCorpus(books_dir=...)), and it is .gitignored, so it is never a shipped or
+    # trusted artifact - it is always created at runtime in a writable location. A
+    # pickle there would let any co-located writer of that directory plant a payload
+    # that executes during pickle.load on the next build() (CWE-502: deserialization
+    # of untrusted data). JSON has no code-execution path on load: a hostile cache
+    # file can at worst feed wrong numbers, which the content-hash signature rejects.
 
     def _cache_path(self) -> Path:
-        return self.books_dir / ".rag_cache.pkl"
+        return self.books_dir / ".rag_cache.json"
 
     def _signature(self, combined: List[Path]) -> str:
+        # Key on book identity (the parent slug - every file's basename is the
+        # identical "_combined.md") and a content hash, not just size+mtime. mtime in
+        # whole seconds plus a shared basename made two different books with equal
+        # (size, mtime-second) collide to the same signature and serve a stale index.
         parts = [str(_CACHE_VERSION), str(self.chunk_words), str(self.overlap)]
         for p in combined:
             st = p.stat()
-            parts.append(f"{p.name}:{st.st_size}:{int(st.st_mtime)}")
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+            parts.append(f"{p.parent.name}:{st.st_size}:{st.st_mtime_ns}:{digest}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     def _load_cache(self, combined: List[Path]) -> bool:
@@ -261,29 +287,36 @@ class BookCorpus:
         if not path.is_file():
             return False
         try:
-            with path.open("rb") as fh:
-                blob = pickle.load(fh)
+            with path.open("r", encoding="utf-8") as fh:
+                blob = json.load(fh)
             if blob.get("sig") != self._signature(combined):
                 return False
-            self._chunks = blob["chunks"]
+            self._chunks = [
+                _Chunk(c["book"], c["text"], c["tf"], c["length"]) for c in blob["chunks"]
+            ]
             self._idf = blob["idf"]
             self._avgdl = blob["avgdl"]
             return True
-        except Exception:
-            # Corrupt or incompatible cache: rebuild silently.
+        except (OSError, ValueError, KeyError, TypeError):
+            # Expected corrupt/incompatible-cache modes (unreadable file, bad JSON,
+            # missing/renamed key, wrong shape): rebuild silently. Anything outside
+            # this set is a real bug and is left to propagate rather than be masked.
             return False
 
     def _save_cache(self, combined: List[Path]) -> None:
         blob = {
             "sig": self._signature(combined),
-            "chunks": self._chunks,
-            "idf": self._idf,
             "avgdl": self._avgdl,
+            "idf": self._idf,
+            "chunks": [
+                {"book": c.book, "text": c.text, "tf": c.tf, "length": c.length}
+                for c in self._chunks
+            ],
         }
         try:
-            tmp = self._cache_path().with_suffix(".pkl.tmp")
-            with tmp.open("wb") as fh:
-                pickle.dump(blob, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp = self._cache_path().with_name(".rag_cache.json.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(blob, fh)
             os.replace(tmp, self._cache_path())
         except OSError:
             # Read-only books dir: skip caching, not fatal.

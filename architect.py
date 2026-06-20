@@ -20,9 +20,9 @@ Everything returned is JSON-serializable (dict/list/str/bool/int).
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from .corpus import BookCorpus
+from .corpus import BookCorpus, BookScope, Retriever
 from .models import (
     GroundingResult,
     PromptAnalysis,
@@ -36,6 +36,11 @@ from .models import (
 # Rough chars-per-token heuristic for the context-window pressure check. Real
 # tokenizers vary (Farris); ~4 chars/token is the standard back-of-envelope.
 _CHARS_PER_TOKEN = 4
+
+# Persona declarations ("act as ...", "you are a ...") are expected near the start
+# of a line; we only scan this many leading characters for an embedded role marker
+# so a mid-sentence mention deep in a paragraph is not misread as the role.
+_ROLE_SCAN_PREFIX_CHARS = 60
 
 # The two titles in the corpus that are squarely about prompt design (Esposito's
 # instruction-formatting / output-guardrail chapters; Pai's prompts-as-pipeline-
@@ -100,7 +105,7 @@ class PromptArchitect:
     """Analyze, refine, and diversify prompts at a production level of quality."""
 
     def __init__(
-        self, books_dir: Optional[str] = None, retriever: Optional[BookCorpus] = None
+        self, books_dir: Optional[str] = None, retriever: Optional[Retriever] = None
     ) -> None:
         """Initialize templates, heuristic defaults, and the (lazy) RAG corpus.
 
@@ -114,7 +119,7 @@ class PromptArchitect:
         """
         self._default_length = "medium"
         self._books_dir = books_dir
-        self._corpus: Optional[BookCorpus] = retriever
+        self._corpus: Optional[Retriever] = retriever
         self._render_template = (
             "[ROLE]\n{role}\n\n"
             "[GOAL]\n{goal}\n\n"
@@ -165,9 +170,9 @@ class PromptArchitect:
         rendered = self._render_prompt(spec)
         analysis_after = self.analyze(rendered, context)
         change_log = self._change_log(
-            analysis_before["components"], analysis_after["components"], context
+            analysis_before["components"], analysis_after["components"], spec
         )
-        grounding = self._ground_refinement(spec, analysis_before, context, k) if ground else []
+        grounding = self._ground_refinement(spec, analysis_before, k) if ground else []
         if grounding:
             spec["notes"].append(
                 "Grounded against the bundled book corpus; see refine()['grounding'] "
@@ -229,11 +234,17 @@ class PromptArchitect:
     # ------------------------------------------------------------------ #
 
     @property
-    def corpus(self) -> BookCorpus:
-        """Lazily build the BM25 book corpus on first grounding request."""
+    def corpus(self) -> Retriever:
+        """Lazily build the book corpus on first grounding request.
+
+        Returns whatever retriever is in use: the default BM25 BookCorpus (built on
+        demand) or an injected backend that satisfies the Retriever protocol. The
+        build()/_built lifecycle is BookCorpus-specific - not part of the protocol -
+        so it is only invoked when the retriever actually is a BookCorpus.
+        """
         if self._corpus is None:
             self._corpus = BookCorpus(self._books_dir).build()
-        elif not getattr(self._corpus, "_built", True):
+        elif isinstance(self._corpus, BookCorpus) and not self._corpus._built:
             self._corpus.build()
         return self._corpus
 
@@ -241,7 +252,6 @@ class PromptArchitect:
         self,
         spec: PromptSpec,
         analysis: PromptAnalysis,
-        context: PromptContext,
         k: int,
     ) -> List[GroundingResult]:
         """Retrieve supporting passages for the refinement's prompt-engineering moves.
@@ -263,7 +273,7 @@ class PromptArchitect:
     @staticmethod
     def _grounding_queries(
         spec: PromptSpec, analysis: PromptAnalysis
-    ) -> List[tuple]:
+    ) -> List[Tuple[str, BookScope]]:
         """Build (query, book_scope) retrieval pairs (de-duplicated by query).
 
         The book corpus is about prompt engineering, not the user's task domain, so
@@ -274,7 +284,7 @@ class PromptArchitect:
         tangential book. The detected issues are already prompt-eng-topical, so they
         stay corpus-wide (scope None) and may match any title.
         """
-        queries: List[tuple] = []
+        queries: List[Tuple[str, BookScope]] = []
         goal = spec["goal"].strip().rstrip(".")
         if goal and not goal.lower().startswith("complete the requested task"):
             queries.append(
@@ -315,14 +325,15 @@ class PromptArchitect:
         for line in self._lines(prompt):
             low = line.lower()
             for marker in _ROLE_MARKERS:
-                if low.startswith(marker) or f" {marker}" in f" {low}"[:60]:
+                if low.startswith(marker) or f" {marker}" in f" {low}"[:_ROLE_SCAN_PREFIX_CHARS]:
                     return line.strip().rstrip(".") if line.strip() else None
         return None
 
     def _extract_goal(self, prompt: str, context: PromptContext) -> Optional[str]:
         """Prefer an explicit goal; else infer the first imperative sentence."""
-        if context.get("goal"):
-            return context["goal"]
+        ctx_goal = context.get("goal")
+        if ctx_goal and ctx_goal.strip():
+            return ctx_goal.strip()
         for sentence in self._sentences(prompt):
             low = sentence.lower().lstrip("- *0123456789.) ")
             if _opens_with_instruction_verb(low):
@@ -365,10 +376,28 @@ class PromptArchitect:
         return steps
 
     def _extract_output_format(self, prompt: str) -> Optional[str]:
+        """Find the output-format declaration.
+
+        Section-aware, like _extract_instructions: in a rendered prompt the first
+        content line of the [OUTPUT] block IS the contract, even when it carries no
+        output marker (e.g. "Return a single JSON object ..."). Lines inside other
+        rendered sections are skipped so a QUALITY CHECK bullet that happens to say
+        "output format" is never mistaken for the contract. In a raw prompt (no
+        [SECTION] headers) we fall back to scanning for an _OUTPUT_MARKERS phrase.
+        """
+        section: Optional[str] = None
         for line in self._lines(prompt):
-            low = line.lower()
-            if self._contains_any(low, _OUTPUT_MARKERS):
-                return line.strip()
+            stripped = line.strip()
+            header = re.match(r"^\[([A-Z ]+)\]$", stripped)
+            if header:
+                section = header.group(1)
+                continue
+            if section == "OUTPUT":
+                return stripped  # rendered [OUTPUT] block: this line is the contract
+            if section is not None:
+                continue  # inside some other rendered section: not the output format
+            if self._contains_any(stripped.lower(), _OUTPUT_MARKERS):
+                return stripped  # raw prompt: marker scan
         return None
 
     def _extract_constraints(
@@ -482,6 +511,11 @@ class PromptArchitect:
                 "Add a QUALITY CHECK section asking the model to verify format and coverage "
                 "before returning."
             )
+        if not components["examples_present"]:
+            suggestions.append(
+                "No example detected; add a short few-shot example (a representative input plus "
+                "the exact expected output) to lock in format and style."
+            )
         if "hallucination" in context.get("risk_points", []):
             suggestions.append(
                 "Instruct the model to mark assumptions explicitly and state uncertainty."
@@ -532,12 +566,16 @@ class PromptArchitect:
     def _spec_goal(
         self, prompt: str, components: PromptComponents, context: PromptContext
     ) -> str:
-        if context.get("goal"):
-            return context["goal"]
+        ctx_goal = context.get("goal")
+        if ctx_goal and ctx_goal.strip():
+            return ctx_goal.strip()
         if components["goal"]:
             return components["goal"]
         # Last resort: synthesize one clear sentence from the prompt's first line.
+        # Strip any leading list marker so a bulleted first line ("- do the thing")
+        # does not become the rendered [GOAL] verbatim, matching _extract_goal.
         first = next((ln.strip() for ln in self._lines(prompt) if ln.strip()), "")
+        first = first.lstrip("- *0123456789.) ").strip()
         return first or "Complete the requested task accurately and completely."
 
     def _spec_inputs(self, components: PromptComponents, context: PromptContext) -> str:
@@ -665,13 +703,16 @@ class PromptArchitect:
         self,
         before: PromptComponents,
         after: PromptComponents,
-        context: PromptContext,
+        spec: PromptSpec,
     ) -> List[str]:
         log: List[str] = []
         if not before["role"] and after["role"]:
             log.append("Added explicit role definition.")
         if not before["output_format"] and after["output_format"]:
-            fmt = context.get("constraints", {}).get("format", "structured")
+            # Report the format the spec actually rendered (merged constraints), not
+            # the context-only value - otherwise a format inferred from the prompt
+            # text shows as "structured" while the OUTPUT block is JSON/markdown.
+            fmt = spec["constraints"].get("format", "structured")
             log.append(f"Specified {fmt} output with explicit structure.")
         if len(after["instructions"]) > len(before["instructions"]):
             log.append(
@@ -725,20 +766,31 @@ class PromptArchitect:
         self, base: PromptSpec, context: PromptContext
     ) -> Dict[str, Any]:
         spec = self._copy_spec(base)
-        fmt = spec["constraints"].get("format", "markdown").lower()
+        # Default to '' (not 'markdown') so the branch matches the other builders and
+        # an unrecognized/custom format is not silently rewritten to markdown.
+        fmt = spec["constraints"].get("format", "").lower()
         if fmt == "json":
             spec["output_contract"] = (
                 "Output MUST be a single valid JSON object with a fixed set of keys and no "
                 "additional keys or surrounding text."
             )
-        else:
+        elif fmt == "markdown":
             spec["output_contract"] = (
                 "Output MUST be markdown containing only the required H2 sections, with no "
                 "introductory or trailing commentary."
             )
+        else:
+            # No recognized format: the base contract may be a caller-supplied custom
+            # line (e.g. "a CSV table with columns id,name,score"). Preserve it and
+            # only tighten it, rather than substituting an unrelated markdown assertion.
+            spec["output_contract"] = (
+                base["output_contract"].rstrip(".")
+                + ". Emit only that output with no extra commentary, preamble, or trailing notes."
+            )
         spec["constraints"] = {**spec["constraints"], "length": "short"}
         spec["quality_checks"] = spec["quality_checks"] + [
-            f"Ensure the output is syntactically valid {fmt} and contains no extra commentary.",
+            f"Ensure the output is syntactically valid {fmt or 'output'} and contains no "
+            "extra commentary.",
         ]
         spec["notes"] = base["notes"] + ["Variant: format-strict, no visible reasoning."]
         return {

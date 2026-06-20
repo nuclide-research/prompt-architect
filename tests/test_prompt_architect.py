@@ -12,6 +12,7 @@ JSON-serializability, and the RAG layer.
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 from prompt_architect import BookCorpus, PromptArchitect
 from prompt_architect.architect import _PROMPT_ENG_BOOKS
@@ -343,6 +344,245 @@ class TestExactnessAndEdges(unittest.TestCase):
     def test_context_window_ok_when_within_budget(self):
         an = self.a.analyze("summarize this", _ctx(model_context_tokens=8000))
         self.assertFalse(any("context window" in i.lower() for i in an["issues"]))
+
+
+class TestVariantMutationSafety(unittest.TestCase):
+    """Review #2: the old mutation test passed even with the deep-copy reverted,
+    because variant appends land in the LIST fields it never checked."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_base_list_fields_unchanged_after_variants(self):
+        # A separate refine fixes the canonical base shape; generating variants must
+        # not have grown base_spec's instructions/notes via in-place appends.
+        canonical = self.a.refine("summarize findings", _ctx(), ground=False)["prompt_spec"]
+        n_instr, n_notes = len(canonical["instructions"]), len(canonical["notes"])
+        v = self.a.generate_variants("summarize findings", _ctx())
+        self.assertEqual(len(v["base_spec"]["instructions"]), n_instr)
+        self.assertEqual(len(v["base_spec"]["notes"]), n_notes)
+
+    def test_base_constraints_dict_not_mutated(self):
+        v = self.a.generate_variants("summarize findings", _ctx())
+        # concise_strict sets length=short on its own copy; base must keep medium.
+        self.assertEqual(v["base_spec"]["constraints"].get("length"), "medium")
+
+
+class TestChangeLogContent(unittest.TestCase):
+    """Review #4 / #13: change_log content (not just length) and the format label."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_change_log_describes_each_real_addition(self):
+        r = self.a.refine("summarize findings", _ctx(constraints={"format": "json"}), ground=False)
+        log = " ".join(r["change_log"]).lower()
+        self.assertIn("role", log)
+        self.assertIn("json output", log)       # #13: inferred/merged format label
+        self.assertIn("quality check", log)
+        self.assertIn("ordered steps", log)
+
+    def test_change_log_format_label_matches_prompt_inferred_format(self):
+        # No format in context; prompt text alone implies JSON. Label must say json.
+        r = self.a.refine("Summarize the findings. Return the result as json.", {}, ground=False)
+        fmt_lines = [l for l in r["change_log"] if "output with explicit" in l]
+        self.assertTrue(fmt_lines)
+        self.assertIn("json", fmt_lines[0].lower())
+        self.assertNotIn("structured output", fmt_lines[0].lower())
+
+
+class TestConstraintsMerge(unittest.TestCase):
+    """Review #9 / #10: constraint precedence at extract and spec levels."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_context_format_wins_over_prompt_inferred(self):
+        an = self.a.analyze("return the result as json", _ctx(constraints={"format": "markdown"}))
+        self.assertEqual(an["components"]["constraints"]["format"], "markdown")
+
+    def test_spec_constraints_three_level_precedence(self):
+        # defaults(length=medium) < prompt(length=short via "concise") < context(tone)
+        r = self.a.refine("be concise and technical", _ctx(constraints={"tone": "formal"}), ground=False)
+        c = r["prompt_spec"]["constraints"]
+        self.assertEqual(c["tone"], "formal")   # context overrides default neutral
+        self.assertEqual(c["length"], "short")  # prompt overrides default medium
+        self.assertIn("technical", c["style"])  # prompt-inferred style
+
+
+class TestComponentExtraction(unittest.TestCase):
+    """Review #5 / #11 / #20 / #21: extractors with no prior coverage."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_role_extracted_and_normalized(self):
+        an = self.a.analyze("You are a senior security analyst.\nSummarize the data.", _ctx())
+        self.assertIsNotNone(an["components"]["role"])
+        self.assertIn("senior security analyst", an["components"]["role"].lower())
+        r = self.a.refine("Act as a SQL expert.\nOptimize the query.", _ctx(), ground=False)
+        self.assertTrue(r["prompt_spec"]["role"].lower().startswith("you are"))
+
+    def test_rendered_json_output_block_not_confused_with_qc_bullet(self):
+        # Review #5: re-analysis must read the [OUTPUT] block, not the QC bullet that
+        # literally contains the words "output format".
+        r = self.a.refine("Summarize findings.", _ctx(constraints={"format": "json"}), ground=False)
+        of = r["analysis_after"]["components"]["output_format"]
+        self.assertIsNotNone(of)
+        self.assertIn("json object", of.lower())
+        self.assertNotIn("verify that", of.lower())
+
+    def test_explicit_inputs_description_detected(self):
+        an = self.a.analyze("Input: a list of CVE records to triage", _ctx())
+        self.assertIsNotNone(an["components"]["inputs_description"])
+
+    def test_inputs_type_selects_template(self):
+        code = self.a.refine("classify the records", _ctx(inputs_type="code"), ground=False)
+        self.assertIn("source code", code["prompt_spec"]["inputs_contract"].lower())
+        ques = self.a.refine("classify the records", _ctx(inputs_type="question"), ground=False)
+        self.assertIn("question", ques["prompt_spec"]["inputs_contract"].lower())
+
+    def test_examples_present_detection_and_suggestion(self):
+        with_ex = self.a.analyze("Summarize. For example: input X gives output Y.", _ctx())
+        self.assertTrue(with_ex["components"]["examples_present"])
+        self.assertFalse(any("few-shot example" in s.lower() for s in with_ex["suggested_improvements"]))
+        no_ex = self.a.analyze("Summarize the data.", _ctx())
+        self.assertFalse(no_ex["components"]["examples_present"])
+        self.assertTrue(any("few-shot example" in s.lower() for s in no_ex["suggested_improvements"]))
+
+
+class TestVariantOutputContracts(unittest.TestCase):
+    """Review #6 / #12: concise_strict JSON branch and custom-format preservation."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_concise_strict_json_branch(self):
+        v = self.a.generate_variants("summarize findings", _ctx(constraints={"format": "json"}))
+        cs = next(x for x in v["variants"] if x["id"] == "concise_strict")
+        oc = cs["prompt_spec"]["output_contract"].lower()
+        self.assertIn("json", oc)
+        self.assertNotIn("markdown", oc)
+        self.assertIn("valid json", " ".join(cs["prompt_spec"]["quality_checks"]).lower())
+
+    def test_concise_strict_preserves_custom_output_contract(self):
+        # A custom (non-json/non-markdown) base contract must survive, not be replaced
+        # with an unrelated markdown-H2 assertion.
+        prompt = "Output format: a CSV table with columns id,name,score"
+        v = self.a.generate_variants(prompt, _ctx(constraints={}))
+        cs = next(x for x in v["variants"] if x["id"] == "concise_strict")
+        oc = cs["prompt_spec"]["output_contract"]
+        self.assertIn("csv", oc.lower())
+        self.assertNotIn("H2", oc)
+
+
+class TestGoalEdges(unittest.TestCase):
+    """Review #14: a whitespace-only context goal must not pass through verbatim."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_whitespace_context_goal_not_passed_through(self):
+        r = self.a.refine("do something useful here", _ctx(goal="   "), ground=False)
+        self.assertTrue(r["prompt_spec"]["goal"].strip())
+        self.assertNotEqual(r["prompt_spec"]["goal"], "   ")
+
+    def test_bulleted_first_line_fallback_is_stripped(self):
+        # No detectable goal verb, list-marker first line -> marker stripped from goal.
+        r = self.a.refine("- zzz qqq mmm", _ctx(domain="", goal=""), ground=False)
+        self.assertFalse(r["prompt_spec"]["goal"].startswith("-"))
+
+
+class TestCorpusConfig(unittest.TestCase):
+    """Review #15: degenerate chunking config fails loud instead of blowing up the index."""
+
+    def test_overlap_ge_chunk_words_raises(self):
+        with self.assertRaises(ValueError):
+            BookCorpus(chunk_words=5, overlap=10)
+        with self.assertRaises(ValueError):
+            BookCorpus(chunk_words=5, overlap=5)
+
+    def test_invalid_chunk_words_raises(self):
+        with self.assertRaises(ValueError):
+            BookCorpus(chunk_words=0)
+
+
+class TestRetrieverInjection(unittest.TestCase):
+    """Review #19 / #22: injected retrievers honor the Retriever protocol contract."""
+
+    def test_injected_unbuilt_bookcorpus_is_built_on_demand(self):
+        c = BookCorpus()
+        self.assertFalse(c._built)
+        a = PromptArchitect(retriever=c)
+        self.assertTrue(a.ground("json schema", k=2))
+        self.assertTrue(c._built)
+
+    def test_protocol_retriever_without_build_is_used_as_is(self):
+        # A non-BookCorpus retriever must be used directly; the BookCorpus-only
+        # build()/_built lifecycle must never be invoked on it. `_built = False`
+        # would trip the old getattr-based build() call and crash (no build method).
+        class FakeRetriever:
+            _built = False
+
+            def search(self, query, k=5, book=None):
+                return [{"book": "fake", "chunk_id": 0, "score": 2.0, "text": "x"}]
+
+        a = PromptArchitect(retriever=FakeRetriever())
+        hits = a.ground("anything", k=1)
+        self.assertEqual(hits[0]["book"], "fake")
+
+
+class TestGroundContract(unittest.TestCase):
+    """Review #3: ground() propagates FileNotFoundError when the corpus is absent."""
+
+    def test_ground_raises_when_corpus_missing(self):
+        with tempfile.TemporaryDirectory() as empty:
+            a = PromptArchitect(books_dir=empty)
+            with self.assertRaises(FileNotFoundError):
+                a.ground("anything", k=2)
+
+
+class TestCacheBehavior(unittest.TestCase):
+    """Review #7 / #16 / #23: signature keys on per-book content; corrupt cache rebuilds."""
+
+    @staticmethod
+    def _mini_corpus(d, books):
+        for name, txt in books.items():
+            (Path(d) / name).mkdir()
+            (Path(d) / name / "_combined.md").write_text(txt, encoding="utf-8")
+
+    def test_signature_distinguishes_same_basename_books_by_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._mini_corpus(d, {"alpha": "aaa bbb ccc", "beta": "ddd eee fff"})
+            c = BookCorpus(books_dir=d)
+            paths = sorted(Path(d).glob("*/_combined.md"))
+            sig_before = c._signature(paths)
+            # Swap the two same-basename files' content: a basename-only key would collide.
+            (Path(d) / "alpha" / "_combined.md").write_text("ddd eee fff", encoding="utf-8")
+            (Path(d) / "beta" / "_combined.md").write_text("aaa bbb ccc", encoding="utf-8")
+            sig_after = c._signature(sorted(Path(d).glob("*/_combined.md")))
+            self.assertNotEqual(sig_before, sig_after)
+
+    def test_content_change_invalidates_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._mini_corpus(d, {"alpha": "one two three four five"})
+            n1 = BookCorpus(books_dir=d).build().num_chunks
+            (Path(d) / "alpha" / "_combined.md").write_text(
+                "one two three four five " * 200, encoding="utf-8"
+            )
+            n2 = BookCorpus(books_dir=d).build().num_chunks  # must not serve stale cache
+            self.assertNotEqual(n1, n2)
+
+    def test_corrupt_cache_rebuilds_silently(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._mini_corpus(d, {"alpha": "prompt output json schema few-shot tokens grounding"})
+            c1 = BookCorpus(books_dir=d).build()
+            self.assertGreater(c1.num_chunks, 0)
+            cache = Path(d) / ".rag_cache.json"
+            self.assertTrue(cache.is_file())
+            cache.write_text("{ not valid json ::::", encoding="utf-8")
+            c2 = BookCorpus(books_dir=d).build()  # must not raise
+            self.assertGreater(c2.num_chunks, 0)
 
 
 class TestJSONSerializable(unittest.TestCase):

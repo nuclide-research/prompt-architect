@@ -46,7 +46,7 @@ python -m prompt_architect.architect      # runs the worked example
 Pure standard library. Requires Python 3.8 or later. No `pip install` step.
 
 ```bash
-python -m unittest discover -s prompt_architect/tests -t .   # 41 regression tests
+python -m unittest discover -s prompt_architect/tests -t .   # 64 regression tests
 ```
 
 # API
@@ -111,7 +111,7 @@ books/*/_combined.md  ->  chunk (220-word windows, 40 overlap)  ->  BM25 index (
    score = idf(t) * tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl))     k1=1.5  b=0.75
 ```
 
-The index builds on first use (about 0.6s, 3,225 chunks across 7 books) and caches to `books/.rag_cache.pkl` keyed on the source files' size and mtime (about 0.1s warm). Swap in an embedding backend by passing any object that implements `search(query, k, book)`:
+The index builds on first use (3,225 chunks across 7 books) and caches to `books/.rag_cache.json` keyed on a content hash of the source files (warm loads skip the rebuild). The cache is JSON, not pickle, so loading it can never execute code. Swap in an embedding backend by passing any object that implements `search(query, k, book)`:
 
 ```python
 PromptArchitect(retriever=my_embedding_corpus)
