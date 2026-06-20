@@ -37,6 +37,17 @@ from .models import (
 # tokenizers vary (Farris); ~4 chars/token is the standard back-of-envelope.
 _CHARS_PER_TOKEN = 4
 
+# The two titles in the corpus that are squarely about prompt design (Esposito's
+# instruction-formatting / output-guardrail chapters; Pai's prompts-as-pipeline-
+# components chapters). The goal-grounding query - "how to structure a prompt to
+# <goal>" - is scoped to these so it retrieves prompting guidance rather than a
+# task-keyword match from a tangential book (e.g. the docs-writing or build-from-
+# scratch titles). Issue queries stay corpus-wide; they are already on-subject.
+_PROMPT_ENG_BOOKS = (
+    "esposito-programming-llms-azure-openai",
+    "pai-designing-llm-applications",
+)
+
 # Signal phrases used by the extraction heuristics. Kept as module constants so a
 # reader can audit and extend the detection surface in one place.
 _ROLE_MARKERS = ("you are", "act as", "assume the role of", "you're a", "you are a")
@@ -243,35 +254,42 @@ class PromptArchitect:
         except (FileNotFoundError, ValueError):
             return []
         results: List[GroundingResult] = []
-        for q in self._grounding_queries(spec, analysis):
-            passages = corpus.search(q, k=k)
+        for q, scope in self._grounding_queries(spec, analysis):
+            passages = corpus.search(q, k=k, book=scope)
             if passages:
                 results.append(GroundingResult(query=q, passages=passages))
         return results
 
     @staticmethod
-    def _grounding_queries(spec: PromptSpec, analysis: PromptAnalysis) -> List[str]:
-        """Build prompt-engineering-topical retrieval queries (de-duplicated).
+    def _grounding_queries(
+        spec: PromptSpec, analysis: PromptAnalysis
+    ) -> List[tuple]:
+        """Build (query, book_scope) retrieval pairs (de-duplicated by query).
 
         The book corpus is about prompt engineering, not the user's task domain, so
         grounding on the raw goal text retrieves task-keyword matches (code, data)
-        instead of prompting guidance. Anchoring the goal query with a prompt-design
-        frame, and grounding on the detected issues (already prompt-eng-topical),
-        keeps retrieval on the books' actual subject.
+        instead of prompting guidance. Two defenses: the goal query is anchored with
+        a prompt-design frame AND scoped to the two prompt-engineering titles
+        (_PROMPT_ENG_BOOKS), so even the frame's task words cannot pull in a
+        tangential book. The detected issues are already prompt-eng-topical, so they
+        stay corpus-wide (scope None) and may match any title.
         """
-        queries: List[str] = []
+        queries: List[tuple] = []
         goal = spec["goal"].strip().rstrip(".")
         if goal and not goal.lower().startswith("complete the requested task"):
             queries.append(
-                f"prompt engineering: how to structure an LLM prompt to {goal[:140]}"
+                (
+                    f"prompt engineering: how to structure an LLM prompt to {goal[:140]}",
+                    _PROMPT_ENG_BOOKS,
+                )
             )
-        queries.extend(analysis["issues"][:3])
+        queries.extend((issue, None) for issue in analysis["issues"][:3])
         seen, out = set(), []
-        for q in queries:
+        for q, scope in queries:
             key = q.strip().lower()
             if key and key not in seen:
                 seen.add(key)
-                out.append(q)
+                out.append((q, scope))
         return out
 
     # ------------------------------------------------------------------ #
@@ -560,7 +578,13 @@ class PromptArchitect:
         ]
 
     def _spec_output(self, components: PromptComponents, context: PromptContext) -> str:
-        fmt = context.get("constraints", {}).get("format", "").lower()
+        # Read the MERGED constraints (context + format inferred from prompt text via
+        # _extract_constraints), not context alone. Otherwise "return the result as json"
+        # sets constraints.format=json but the OUTPUT block defaults to markdown - the
+        # exact OUTPUT/CONSTRAINTS contradiction this tool exists to catch. The cot and
+        # concise_strict variants already read merged constraints; this aligns the base
+        # contract (and fewshot, which inherits it) with them.
+        fmt = self._spec_constraints(components, context).get("format", "").lower()
         if fmt == "json":
             return (
                 "Return a single JSON object. Use clear, fixed keys with consistent value types. "

@@ -21,7 +21,7 @@ import os
 import pickle
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, runtime_checkable
+from typing import Dict, Iterable, List, Optional, Protocol, Union, runtime_checkable
 
 from .models import Retrieved
 
@@ -39,6 +39,9 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _K1 = 1.5
 _B = 0.75
 
+# A book scope is one slug, an iterable of slugs, or None (corpus-wide).
+BookScope = Union[str, Iterable[str], None]
+
 _CACHE_VERSION = 2  # bump when chunking or index format changes
 
 
@@ -51,7 +54,7 @@ def tokenize(text: str) -> List[str]:
 class Retriever(Protocol):
     """Pluggable retrieval backend. Swap BM25 for embeddings by implementing this."""
 
-    def search(self, query: str, k: int = 5, book: Optional[str] = None) -> List[Retrieved]:
+    def search(self, query: str, k: int = 5, book: "BookScope" = None) -> List[Retrieved]:
         ...
 
 
@@ -172,8 +175,13 @@ class BookCorpus:
     # Search
     # ------------------------------------------------------------------ #
 
-    def search(self, query: str, k: int = 5, book: Optional[str] = None) -> List[Retrieved]:
-        """Return the top-k passages for `query`, optionally scoped to one book."""
+    def search(self, query: str, k: int = 5, book: "BookScope" = None) -> List[Retrieved]:
+        """Return the top-k passages for `query`, optionally scoped to a book set.
+
+        `book` may be a single slug, an iterable of slugs, or None (corpus-wide).
+        An empty iterable means "no book matches" and yields no results, rather
+        than silently widening to the whole corpus.
+        """
         if not self._built:
             self.build()
         q_terms = tokenize(query)
@@ -182,9 +190,13 @@ class BookCorpus:
         # Pre-resolve idf for query terms once.
         q_idf = {t: self._idf.get(t, 0.0) for t in set(q_terms)}
 
+        scope = self._normalize_scope(book)
+        if scope is not None and not scope:
+            return []
+
         scored: List[tuple] = []
         for cid, chunk in enumerate(self._chunks):
-            if book is not None and chunk.book != book:
+            if scope is not None and chunk.book not in scope:
                 continue
             score = self._bm25(q_idf, chunk)
             if score > 0:
@@ -202,6 +214,20 @@ class BookCorpus:
                 )
             )
         return results
+
+    @staticmethod
+    def _normalize_scope(book: "BookScope") -> Optional[frozenset]:
+        """Normalize a book scope to None (corpus-wide) or a frozenset of slugs.
+
+        A bare string is one slug; any other iterable becomes a slug set. Returning
+        an empty frozenset is meaningful: the caller asked for a set that matched no
+        book, so search returns nothing instead of widening to the whole corpus.
+        """
+        if book is None:
+            return None
+        if isinstance(book, str):
+            return frozenset((book,))
+        return frozenset(book)
 
     def _bm25(self, q_idf: Dict[str, float], chunk: _Chunk) -> float:
         score = 0.0

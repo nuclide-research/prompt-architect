@@ -10,9 +10,11 @@ JSON-serializability, and the RAG layer.
 """
 
 import json
+import tempfile
 import unittest
 
 from prompt_architect import BookCorpus, PromptArchitect
+from prompt_architect.architect import _PROMPT_ENG_BOOKS
 
 
 def _ctx(**over):
@@ -193,6 +195,154 @@ class TestRAG(unittest.TestCase):
         self.assertTrue(r["grounding"])
         first_q = r["grounding"][0]["query"].lower()
         self.assertIn("prompt", first_q)
+
+
+class TestOutputContractFix(unittest.TestCase):
+    """Fix #2: the base OUTPUT contract must agree with the merged constraints,
+    including a format inferred from the prompt text (not just context)."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_base_output_contract_agrees_with_prompt_inferred_format(self):
+        # No format in context; the prompt text alone says JSON.
+        ctx = _ctx(constraints={})
+        r = self.a.refine("Extract the fields and return the result as json.", ctx, ground=False)
+        spec = r["prompt_spec"]
+        self.assertEqual(spec["constraints"].get("format"), "json")
+        oc = spec["output_contract"].lower()
+        self.assertIn("json", oc)
+        # The markdown default must not leak through when JSON was requested.
+        self.assertNotIn("markdown", oc)
+
+    def test_fewshot_inherits_corrected_output_contract(self):
+        ctx = _ctx(constraints={})
+        v = self.a.generate_variants("Extract the fields and return the result as json.", ctx)
+        fs = next(x for x in v["variants"] if x["id"] == "fewshot_skeleton")
+        self.assertIn("json", fs["prompt_spec"]["output_contract"].lower())
+
+
+class TestGroundingQueries(unittest.TestCase):
+    """Fix #3 internals: goal query is prompt-eng-scoped; issues stay corpus-wide
+    and are capped; the placeholder goal is skipped."""
+
+    def _spec(self, goal):
+        return {
+            "role": "r", "goal": goal, "inputs_contract": "i", "instructions": [],
+            "output_contract": "o", "constraints": {}, "quality_checks": [], "notes": [],
+        }
+
+    def _analysis(self, issues):
+        return {"components": {}, "issues": issues, "risk_assessment": [], "suggested_improvements": []}
+
+    def test_goal_query_is_prompt_eng_scoped(self):
+        qs = PromptArchitect._grounding_queries(self._spec("flag secrets in json"), self._analysis([]))
+        self.assertEqual(len(qs), 1)
+        q, scope = qs[0]
+        self.assertIn("prompt engineering", q.lower())
+        self.assertEqual(tuple(scope), _PROMPT_ENG_BOOKS)
+
+    def test_placeholder_goal_query_is_skipped(self):
+        qs = PromptArchitect._grounding_queries(
+            self._spec("Complete the requested task accurately."),
+            self._analysis(["issue one", "issue two"]),
+        )
+        self.assertTrue(all("prompt engineering" not in q.lower() for q, _ in qs))
+        self.assertTrue(all(scope is None for _, scope in qs))
+
+    def test_issue_queries_capped_at_three_and_corpus_wide(self):
+        qs = PromptArchitect._grounding_queries(
+            self._spec("Complete the requested task accurately."),
+            self._analysis([f"issue {i}" for i in range(5)]),
+        )
+        self.assertEqual(len(qs), 3)  # placeholder goal skipped, 5 issues -> 3
+        self.assertTrue(all(scope is None for _, scope in qs))
+
+    def test_refine_goal_grounding_passages_are_prompt_eng_books(self):
+        r = self.a.refine("look at the json and flag secrets", _ctx())  # noqa: F841
+        first = r["grounding"][0]
+        self.assertTrue(first["passages"])
+        self.assertTrue(all(p["book"] in _PROMPT_ENG_BOOKS for p in first["passages"]))
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+
+class TestCorpusScope(unittest.TestCase):
+    """BookCorpus.search book scope: single slug, iterable, empty, and BM25 order."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = BookCorpus().build()
+
+    def test_iterable_scope_limits_to_given_books(self):
+        slugs = list(_PROMPT_ENG_BOOKS)
+        hits = self.c.search("prompt instruction format", k=8, book=slugs)
+        self.assertTrue(hits)
+        self.assertTrue(set(h["book"] for h in hits).issubset(set(slugs)))
+
+    def test_empty_scope_returns_empty_not_corpus_wide(self):
+        self.assertEqual(self.c.search("prompt", k=5, book=[]), [])
+
+    def test_single_slug_scope_still_works(self):
+        hits = self.c.search("context window tokens", k=3, book="farris-how-llms-work")
+        self.assertTrue(hits)
+        self.assertEqual({h["book"] for h in hits}, {"farris-how-llms-work"})
+
+    def test_stopword_only_query_returns_empty(self):
+        self.assertEqual(self.c.search("the and of to with", k=5), [])
+
+    def test_scores_are_descending(self):
+        hits = self.c.search("json output schema guardrails", k=8)
+        scores = [h["score"] for h in hits]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_cache_round_trip_is_identical(self):
+        # A fresh corpus over the same dir loads the pickle cache and must return
+        # byte-identical results to the in-memory build.
+        warm = BookCorpus().build()
+        q = "few-shot examples improve output"
+        a, b = self.c.search(q, k=5), warm.search(q, k=5)
+        self.assertEqual(a, b)
+
+
+class TestDegradation(unittest.TestCase):
+    """Missing corpus must degrade, not raise, when grounding is requested."""
+
+    def test_missing_books_dir_yields_empty_grounding(self):
+        with tempfile.TemporaryDirectory() as empty:
+            a = PromptArchitect(books_dir=empty)
+            r = a.refine("summarize findings", _ctx(), ground=True)
+            self.assertEqual(r["grounding"], [])  # best-effort, no FileNotFoundError
+
+
+class TestExactnessAndEdges(unittest.TestCase):
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_reanalysis_instruction_count_matches_spec(self):
+        # Round-trip fidelity: re-analyzing the rendered prompt recovers exactly the
+        # instruction steps the spec declared (no over- or under-count).
+        r = self.a.refine("summarize findings", _ctx(), ground=False)
+        spec_n = len(r["prompt_spec"]["instructions"])
+        after_n = len(r["analysis_after"]["components"]["instructions"])
+        self.assertEqual(after_n, spec_n)
+
+    def test_concise_strict_defaults_to_markdown(self):
+        v = self.a.generate_variants("summarize findings", _ctx(constraints={}))
+        cs = next(x for x in v["variants"] if x["id"] == "concise_strict")
+        oc = cs["prompt_spec"]["output_contract"].lower()
+        self.assertIn("markdown", oc)
+        self.assertNotIn("json", oc)
+
+    def test_context_window_overflow_is_flagged(self):
+        # A long prompt against a tiny window must raise the context-window issue.
+        an = self.a.analyze("word " * 200, _ctx(model_context_tokens=10))
+        self.assertTrue(any("context window" in i.lower() for i in an["issues"]))
+
+    def test_context_window_ok_when_within_budget(self):
+        an = self.a.analyze("summarize this", _ctx(model_context_tokens=8000))
+        self.assertFalse(any("context window" in i.lower() for i in an["issues"]))
 
 
 class TestJSONSerializable(unittest.TestCase):

@@ -46,7 +46,7 @@ python -m prompt_architect.architect      # runs the worked example
 Pure standard library. Requires Python 3.8 or later. No `pip install` step.
 
 ```bash
-python -m unittest discover -s prompt_architect/tests -t .   # 23 regression tests
+python -m unittest discover -s prompt_architect/tests -t .   # 41 regression tests
 ```
 
 # API
