@@ -342,7 +342,7 @@ class PromptArchitect:
         # No list markup: fall back to imperative sentences.
         for sentence in self._sentences(prompt):
             low = sentence.lower().lstrip("- *")
-            if low.startswith(_INSTRUCTION_VERBS):
+            if _opens_with_instruction_verb(low):
                 steps.append(sentence.strip())
         return steps
 

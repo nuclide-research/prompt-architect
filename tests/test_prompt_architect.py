@@ -70,6 +70,17 @@ class TestGoalExtraction(unittest.TestCase):
         an = self.a.analyze("pull out the sensitive fields", _ctx(domain=""))
         self.assertIsNotNone(an["components"]["goal"])
 
+    def test_word_boundary_no_prefix_false_match(self):
+        # A bare opener fires; a longer word that merely starts with a verb must not.
+        ctx = _ctx(domain="")
+        self.assertIsNotNone(self.a.analyze("scan the logs", ctx)["components"]["goal"])
+        for text in ("Scanning the logs revealed a leak",
+                     "Finding nemo is a movie",
+                     "Designers love whitespace"):
+            self.assertIsNone(
+                self.a.analyze(text, ctx)["components"]["goal"], msg=text
+            )
+
     def test_instruction_fallback_uses_goal_not_literal_the_task(self):
         # Fix #1b: with no detectable goal, step 2 must not read "achieve: the task".
         r = self.a.refine("xyzzy plugh", _ctx(), ground=False)
