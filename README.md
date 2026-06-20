@@ -1,137 +1,211 @@
 <h1 align="center">prompt-architect</h1>
 
-<h4 align="center">Expert prompt-engineering assistant. Prompts as structured artifacts, grounded by a book corpus.</h4>
+<p align="center"><i>Treat a prompt like code: structure it, lint it, refactor it, ground every change in a book.</i></p>
 
 <p align="center">
-  <a href="https://github.com/nuclide-research/prompt-architect/releases"><img src="https://img.shields.io/github/v/release/nuclide-research/prompt-architect?style=flat-square" alt="release"></a>
-  <a href="https://github.com/nuclide-research/prompt-architect/blob/main/LICENSE"><img src="https://img.shields.io/github/license/nuclide-research/prompt-architect?style=flat-square" alt="license"></a>
-  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="python"></a>
-  <a href="https://nuclide-research.com"><img src="https://img.shields.io/badge/by-NuClide-blue?style=flat-square" alt="NuClide"></a>
-</p>
-
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#api">API</a> •
-  <a href="#runtime-rag">RAG</a> •
-  <a href="#data-models">Models</a> •
-  <a href="#scope">Scope</a>
+  <img src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="python 3.8+">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/deps-none-success?style=flat-square" alt="zero dependencies">
+  <img src="https://img.shields.io/badge/by-NuClide-blue?style=flat-square" alt="NuClide">
 </p>
 
 ---
 
-prompt-architect is a Python library that treats a prompt as a structured artifact: role, goal, input and output contracts, constraints, and self-checks. Given a raw prompt and a small context object, it discovers the prompt's implicit structure, names the structural and behavioral problems, refines it into a canonical production-ready form, and generates optimization-focused variants. Every refinement is grounded against an embedded corpus of seven O'Reilly titles using a pure-Python BM25 retriever, so each fix points back to the passage that justifies it.
+A prompt is usually a paragraph of hope. `prompt-architect` treats it as an artifact with parts: a role, a goal, an input contract, ordered instructions, an output contract, constraints, and a self-check. It reads a raw prompt, finds the parts that are missing or contradictory, rewrites it into a canonical form, and offers optimization-focused variants. Every rewrite is justified by a passage from one of seven O'Reilly books bundled with the package and searched at runtime.
 
-The heuristics are pure functions with no I/O. The book corpus is optional and lazy: it builds only on the first grounding call, caches to disk, and never touches the network. Every return value is JSON-serializable.
+It calls no model and reaches no network. It analyzes prompts and writes prompts; it does not run them. Pure Python, standard library only, deterministic, and every return value is JSON.
 
-# Features
+## The idea
 
-- Three operations: `analyze` a prompt, `refine` it into a canonical spec, `generate_variants`
-- Prompts modeled as structured specs: role, goal, inputs contract, ordered instructions, output contract, constraints, quality checks
-- Issue and risk detection: missing role, absent output format, vague instructions, no self-check, hallucination and security risk by context
-- Three variants per prompt: `cot` (chain-of-thought), `concise_strict` (format-strict, machine-friendly), `fewshot_skeleton` (few-shot demonstration)
-- Runtime RAG: pure-Python BM25 over the bundled books grounds every refinement and answers direct passage queries
-- Pluggable retriever: swap BM25 for an embedding backend via the `Retriever` protocol
-- Offline, dependency-free, deterministic. No model download, no API calls, no third-party packages
-- Every return value is JSON-serializable
-
-# Installation
-
-```bash
-git clone https://github.com/nuclide-research/prompt-architect
-cd prompt-architect
-python -m prompt_architect.architect      # runs the worked example
+```
+                  raw prompt + a small context dict
+                                |
+        ┌───────────────────────┼───────────────────────┐
+        v                       v                       v
+    analyze()               refine()            generate_variants()
+        |                       |                       |
+  what's missing,        one canonical          cot / concise_strict /
+  what's risky,          PromptSpec +           fewshot_skeleton,
+  what to fix            a change_log +         each a full spec
+                         book citations
 ```
 
-Pure standard library. Requires Python 3.8 or later. No `pip install` step.
+Three operations transform a prompt: `analyze` inspects, `refine` rewrites, `generate_variants` explores. A fourth, `ground`, stands apart: it queries the book corpus directly. `generate_variants` builds on `refine` rather than standing beside it.
 
-```bash
-python -m unittest discover -s prompt_architect/tests -t .   # 64 regression tests
-```
-
-# API
-
-### `analyze(prompt, context)`
-
-Inspect a raw prompt against best practices. Returns a `PromptAnalysis`: discovered components, structural and behavioral issues, a risk assessment, and high-level suggestions. Never mutates the prompt.
+## A real look
 
 ```python
 from prompt_architect import PromptArchitect
 
 a = PromptArchitect()
 context = {
-    "goal": "Summarize AI/LLM infrastructure exposures for security engineers",
     "audience": "security engineers",
-    "constraints": {"format": "markdown", "length": "medium"},
+    "constraints": {"format": "json"},
     "risk_points": ["hallucination", "security"],
-    "domain": "ai_llm_infra_security",
     "inputs_type": "data_summary",
+    "model_context_tokens": 8000,
 }
-a.analyze("Summarize the exposures and tell engineers what to fix.", context)
+
+a.analyze("look at the findings and pull out anything sensitive", context)["issues"]
+```
+```python
+['No explicit ROLE; model may infer an inconsistent persona.',
+ 'Context specifies format but prompt does not; risk of inconsistent outputs.',
+ 'No clear stepwise INSTRUCTIONS; complex tasks should be broken into steps.',
+ 'No QUALITY CHECK; model is not asked to self-verify before answering.']
 ```
 
-### `refine(prompt, context, ground=True, k=2)`
-
-Refine a raw prompt into a structured `PromptSpec` and rendered string. Returns `prompt_spec`, `rendered_prompt`, `analysis_before`, `analysis_after`, `change_log`, and `grounding`. The goal and each detected issue become retrieval queries against the corpus, k passages each. `ground=False` skips retrieval.
+The `risk_points` you passed drive a separate pass. They surface here, not in the structural issues above:
 
 ```python
-r = a.refine("Summarize the exposures and tell engineers what to fix.", context)
-r["rendered_prompt"]   # canonical [ROLE]/[GOAL]/[INPUTS]/[INSTRUCTIONS]/[OUTPUT]/...
-r["change_log"]        # ["Added explicit role definition.", "Expanded instructions 1->3", ...]
-r["grounding"]         # [{query, passages:[{book, chunk_id, score, text}]}]
+a.analyze("look at the findings and pull out anything sensitive", context)["risk_assessment"]
+```
+```python
+['Hallucination risk: no request to state uncertainty or separate facts from assumptions.']
 ```
 
-### `generate_variants(prompt, context, n=3)`
-
-Generate up to N optimization-focused variants from the refined base. Returns `base_spec` and `variants`, each a `PromptVariant` with its own spec and rendered string. Grounding is skipped here to stay lean.
+Now refine it. The raw line becomes a structured prompt, and each move is logged and backed by a passage:
 
 ```python
-v = a.generate_variants("Summarize the exposures and tell engineers what to fix.", context)
-[x["id"] for x in v["variants"]]   # ['cot', 'concise_strict', 'fewshot_skeleton']
+r = a.refine("look at the findings and pull out anything sensitive", context)
+
+print(r["change_log"])
+# ['Added explicit role definition.',
+#  'Specified json output with explicit structure.',
+#  'Expanded instructions from 1 to 3 ordered steps.',
+#  'Introduced a quality check to reduce format drift and hallucination risk.']
+
+print(r["rendered_prompt"])
+```
+```
+[ROLE]
+You are a senior subject-matter expert and technical writer who produces precise, actionable output for security engineers.
+
+[GOAL]
+look at the findings and pull out anything sensitive
+
+[INPUTS]
+You will receive a structured summary of data (records, metrics, or findings) with optional metadata such as severity, sector, and category.
+
+[INSTRUCTIONS]
+1. Read the inputs carefully and extract the key entities, facts, and intent.
+2. Perform the core work required to achieve: look at the findings and pull out anything sensitive.
+3. Organize the result according to the OUTPUT contract below.
+
+[OUTPUT]
+Return a single JSON object. Use clear, fixed keys with consistent value types. Do not include commentary outside the JSON.
+
+[CONSTRAINTS]
+- Style: concise, technical, no marketing
+- Tone: neutral
+- Length: medium
+- Format: json
+
+[QUALITY CHECK]
+Before returning your final answer:
+- Verify that the response follows the specified output format and includes all required sections or fields.
+- Clearly mark any assumptions or speculative content; do not present them as facts.
+- Ensure no unsafe instructions or secrets are fabricated or exposed.
 ```
 
-### `ground(query, k=5, book=None)`
+`r["grounding"]` carries the passages behind the rewrite, one query per move:
 
-Direct RAG entry point. Returns the top-k book passages for a query, optionally scoped to one book slug.
+```python
+r["grounding"][0]["query"]
+# 'prompt engineering: how to structure an LLM prompt to look at the findings and pull out anything sensitive'
+r["grounding"][0]["passages"][0]
+# {'book': 'esposito-programming-llms-azure-openai', 'chunk_id': 1483, 'score': 12.57, 'text': '...'}
+```
+
+## Operations
+
+### `analyze(prompt, context) -> PromptAnalysis`
+
+Read-only inspection. Returns the discovered `components`, a list of structural and behavioral `issues`, a `risk_assessment` keyed off `context["risk_points"]`, and high-level `suggested_improvements`. Never mutates the prompt.
+
+It detects a missing role, an absent output format, vague or single-step instructions, a missing self-check, a context-window squeeze, and risk that the context flags: hallucination when nothing asks the model to mark uncertainty, security when the prompt touches code or commands without bounding them, compliance when output is unstructured.
+
+### `refine(prompt, context, ground=True, k=2) -> dict`
+
+Rewrite the prompt into a canonical `PromptSpec` and a rendered string. Returns:
+
+| key | what it is |
+|-----|-----------|
+| `prompt_spec` | the structured spec (role, goal, contracts, instructions, constraints, checks) |
+| `rendered_prompt` | the spec rendered into the seven labeled sections above |
+| `analysis_before` / `analysis_after` | the prompt analyzed raw, then re-analyzed after the rewrite |
+| `change_log` | a plain-language diff of what changed and why |
+| `grounding` | per-move book passages: `[{query, passages: [{book, chunk_id, score, text}]}]` |
+
+The goal becomes one retrieval query, scoped to the two prompt-engineering titles so it pulls prompting guidance rather than a keyword match from a tangential book. Each detected issue becomes another, corpus-wide. `ground=False` skips retrieval entirely; `k` sets passages per query. If the books are absent, grounding degrades to an empty list rather than raising.
+
+### `generate_variants(prompt, context, n=3) -> dict`
+
+Refine once, then fork the base spec into up to `n` optimization-focused variants. Returns `base_spec` and `variants`, each a full `PromptVariant` with its own spec and rendered string:
+
+- `cot` adds explicit step-by-step reasoning, as a JSON `reasoning` array when the output is JSON or a `## Reasoning` section otherwise, so the reasoning never contradicts the format.
+- `concise_strict` strips reasoning and hardens the output contract for machine consumption. A custom output format (a CSV layout, say) is preserved, not overwritten.
+- `fewshot_skeleton` appends a few-shot demonstration slot for you to fill with real examples.
+
+Variants are deep-copied from the base, so building them never mutates `base_spec`.
+
+### `ground(query, k=5, book=None) -> list[Retrieved]`
+
+The corpus, directly. Top-`k` passages for a query. Scope it to one book with a slug, or to several by passing a list:
 
 ```python
 a.ground("how to specify a json output schema", k=3)
 a.ground("context window token limits", k=2, book="farris-how-llms-work")
+a.ground("few-shot prompting", k=4,
+         book=["esposito-programming-llms-azure-openai", "pai-designing-llm-applications"])
 ```
 
-# Runtime RAG
+## Grounding: how retrieval works
 
-The retriever is pure-Python BM25 over the per-book `_combined.md` extractions under `books/`. It chunks each book into overlapping word windows, builds a term-frequency and inverse-document-frequency index once, and scores every chunk per query. No model download, no network, no third-party packages.
+The retriever is BM25 over the bundled books. No model, no embeddings service, no third-party package. Each book's combined Markdown is split into overlapping word windows, indexed once, and scored per query.
 
 ```
-books/*/_combined.md  ->  chunk (220-word windows, 40 overlap)  ->  BM25 index (tf, idf, avgdl)
-                                                                          |
-   query  ->  tokenize  ->  score every chunk  ->  top-k passages  <------+
+books/*/_combined.md
+        |
+        v
+   chunk into 220-word windows, 40-word overlap
+        |
+        v
+   term-frequency + inverse-document-frequency index  (tf, idf, avgdl)
+        |
+        |     query --> tokenize --> drop stopwords
+        v                               |
+   score every chunk  <-----------------+
+        |
+        v
+   top-k passages
 
-   score = idf(t) * tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl))     k1=1.5  b=0.75
+   score(t) = idf(t) * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl/avgdl))
+              k1 = 1.5    b = 0.75
 ```
 
-The index builds on first use (3,225 chunks across 7 books) and caches to `books/.rag_cache.json` keyed on a content hash of the source files (warm loads skip the rebuild). The cache is JSON, not pickle, so loading it can never execute code. Swap in an embedding backend by passing any object that implements `search(query, k, book)`:
+The index builds on first use (3,225 chunks across 7 books) and caches to `books/.rag_cache.json`, keyed on a content hash of the sources so an edited book invalidates the cache automatically. The cache is JSON, never pickle, so loading it can never execute code.
+
+Swap BM25 for embeddings without touching the rest. Anything with a `search(query, k, book)` method satisfies the `Retriever` protocol:
 
 ```python
 PromptArchitect(retriever=my_embedding_corpus)
 ```
 
-# Data models
+## Data models
 
-All models are `TypedDict`s in `models.py`, kept JSON-serializable.
+Every model is a `TypedDict` in `models.py`, kept strictly JSON-serializable: dicts, lists, strings, numbers, booleans, nothing else.
 
 ```
 PromptContext      goal, audience, model_name, model_context_tokens,
-                   constraints{style,tone,format,length}, risk_points[],
+                   constraints{style, tone, format, length}, risk_points[],
                    domain, inputs_type
 
 PromptComponents   role, goal, inputs_description, instructions[],
                    output_format, constraints{}, examples_present,
                    quality_check_present
 
-PromptAnalysis     components, issues[], risk_assessment[],
-                   suggested_improvements[]
+PromptAnalysis     components, issues[], risk_assessment[], suggested_improvements[]
 
 PromptSpec         role, goal, inputs_contract, instructions[],
                    output_contract, constraints{}, quality_checks[], notes[]
@@ -142,50 +216,58 @@ Retrieved          book, chunk_id, score, text
 GroundingResult    query, passages[Retrieved]
 ```
 
-# Example
+`PromptContext` is the only input you supply, and every field is optional. The richer it is, the sharper the analysis: `risk_points` drives the risk pass, `model_context_tokens` drives the length check, `constraints.format` aligns the output contract.
 
-```
-$ python -c "from prompt_architect import PromptArchitect; \
-  a=PromptArchitect(); \
-  print('\n'.join(f'[{r[\"score\"]:.1f}] {r[\"book\"]}' \
-  for r in a.ground('json output schema guardrails', k=3)))"
+## Install and run
 
-[17.4] pai-designing-llm-applications
-[15.1] esposito-programming-llms-azure-openai
-[14.8] esposito-programming-llms-azure-openai
-```
+No package index, no build step. Clone and use.
 
-```
-$ python -m prompt_architect.architect
+```bash
+git clone https://github.com/nuclide-research/prompt-architect
+cd prompt-architect
 
-=== REFINE ===
-change_log:
-  Added explicit role definition.
-  Specified markdown output with explicit structure.
-  Expanded instructions from 1 to 3 ordered steps.
-  Introduced a quality check to reduce format drift and hallucination risk.
-
-=== GROUNDING (RAG over books) ===
-Q: No explicit ROLE; model may infer an inconsistent persona.
-  [16.83] bhatti-docs-for-developers   ...a persona named "Charles" that represents them...
+python -m prompt_architect.architect                          # worked example: analyze, refine, variants, grounding
+python -m unittest discover -s prompt_architect/tests -t .     # 64 regression tests
 ```
 
-# Book corpus
+Requires Python 3.8 or later. Nothing else.
 
-Seven O'Reilly titles ground the design. Full Markdown is bundled under `books/` (per-chapter plus `_combined.md`), extracted with [colophon](https://github.com/nuclide-research/colophon). See [`books/MANIFEST.md`](books/MANIFEST.md) for the URN-to-concern map. The heuristics align with these texts; the RAG layer retrieves from them at runtime.
+## What it guarantees
 
-# Scope
+- **Offline.** No network call, no telemetry, no model download. The bundled corpus is the only thing it reads.
+- **Deterministic.** Same prompt and context in, same structures out. Easy to snapshot-test.
+- **JSON all the way down.** Hand any return value to `json.dumps` without a custom encoder.
+- **Pure functions.** The heuristics have no I/O. The corpus is the one optional, lazy side: it builds only on the first grounding call.
+- **No magic boundary.** The cache is data, not code. A planted cache file can at worst feed wrong numbers, which the content-hash signature rejects.
 
-prompt-architect is a local library. It analyzes and rewrites prompt text and retrieves from a local corpus. It makes no network calls, sends no telemetry, and downloads no models. The bundled corpus is the only data it reads. It does not call an LLM; it produces prompts for one.
+## The book corpus
 
-# Our other projects
+Seven O'Reilly titles ground the heuristics and feed the RAG layer. Full Markdown is bundled under `books/`, per-chapter plus a `_combined.md`, extracted with [colophon](https://github.com/nuclide-research/colophon).
+
+| slug | what it anchors |
+|------|-----------------|
+| `esposito-programming-llms-azure-openai` | system vs user prompts, instruction formatting, output guardrails |
+| `pai-designing-llm-applications` | prompts as pipeline components, planner/worker/critic roles, RAG |
+| `farris-how-llms-work` | context windows, why length and ordering and clarity matter |
+| `cronin-decoding-llms` | capability limits, when to split a task, hallucination at the prompt level |
+| `raschka-build-llm-from-scratch` | tokenization and model internals behind the heuristics |
+| `bhatti-docs-for-developers` | personas, audience modeling, structured technical writing |
+| `chinchilla-technical-writing-for-software-developers` | precise, scannable writing for engineers |
+
+See [`books/MANIFEST.md`](books/MANIFEST.md) for the URN-to-concern map.
+
+## Scope
+
+A local library. It inspects and rewrites prompt text and retrieves from a local corpus, and that is the whole footprint. It sends nothing anywhere. It produces prompts for a model; it never calls one.
+
+## Related work
 
 - [tome](https://github.com/nuclide-research/tome) — canonical AI/ML platform corpus and passive fingerprinter
-- [aimap](https://github.com/nuclide-research/aimap) — AI/ML infrastructure fingerprint scanner
 - [colophon](https://github.com/nuclide-research/colophon) — extract an O'Reilly Learning book to local Markdown
+- [aimap](https://github.com/nuclide-research/aimap) — AI/ML infrastructure fingerprint scanner
 - [BARE](https://github.com/nuclide-research/BARE) — semantic exploit-module ranking over scanner findings
 - [herald](https://github.com/nuclide-research/herald) — HTTP auth-posture probe
 
-# License
+## License
 
 MIT. Part of the NuClide toolchain. Contact: [nuclide-research.com](https://nuclide-research.com)
