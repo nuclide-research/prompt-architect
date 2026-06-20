@@ -10,6 +10,7 @@ JSON-serializability, and the RAG layer.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -347,15 +348,39 @@ class TestExactnessAndEdges(unittest.TestCase):
 
 
 class TestVariantMutationSafety(unittest.TestCase):
-    """Review #2: the old mutation test passed even with the deep-copy reverted,
-    because variant appends land in the LIST fields it never checked."""
+    """Review #2 / verification re-review: guard the _copy_spec deep copy directly.
+
+    The end-to-end no-growth checks below are necessary but not sufficient: the
+    variant builders rebind every field they touch (list concatenation, dict
+    unpack), so they pass even if _copy_spec shares the base's mutable objects by
+    reference. test_copy_spec_isolates_mutable_fields is the load-bearing guard:
+    it mutates the copy's lists/dict IN PLACE, which only stays isolated from the
+    base when _copy_spec actually copies them. Revert any list(...)/dict(...) in
+    _copy_spec to a bare reference and that test fails; these two still pass."""
 
     def setUp(self):
         self.a = PromptArchitect()
 
+    def test_copy_spec_isolates_mutable_fields(self):
+        base = self.a.refine("summarize findings", _ctx(), ground=False)["prompt_spec"]
+        copy = PromptArchitect._copy_spec(base)
+        # In-place mutation of every mutable field of the copy.
+        copy["instructions"].append("LEAK")
+        copy["quality_checks"].append("LEAK")
+        copy["notes"].append("LEAK")
+        copy["constraints"]["LEAK"] = "x"
+        # None of it may bleed back into the base spec.
+        self.assertNotIn("LEAK", base["instructions"])
+        self.assertNotIn("LEAK", base["quality_checks"])
+        self.assertNotIn("LEAK", base["notes"])
+        self.assertNotIn("LEAK", base["constraints"])
+        # And the copy is a distinct object per mutable field.
+        self.assertIsNot(copy["instructions"], base["instructions"])
+        self.assertIsNot(copy["constraints"], base["constraints"])
+
     def test_base_list_fields_unchanged_after_variants(self):
         # A separate refine fixes the canonical base shape; generating variants must
-        # not have grown base_spec's instructions/notes via in-place appends.
+        # not have grown base_spec's instructions/notes.
         canonical = self.a.refine("summarize findings", _ctx(), ground=False)["prompt_spec"]
         n_instr, n_notes = len(canonical["instructions"]), len(canonical["notes"])
         v = self.a.generate_variants("summarize findings", _ctx())
@@ -402,12 +427,24 @@ class TestConstraintsMerge(unittest.TestCase):
         self.assertEqual(an["components"]["constraints"]["format"], "markdown")
 
     def test_spec_constraints_three_level_precedence(self):
-        # defaults(length=medium) < prompt(length=short via "concise") < context(tone)
+        # defaults(length=medium) < prompt(length=short via "concise") < context(tone).
+        # NB: style is NOT asserted here. The spec-level default style is byte-identical
+        # to the prompt-inferred value, so a spec-level style check is vacuous (it passes
+        # even with the inference deleted). The real guard is at the components level in
+        # test_prompt_inferred_style_surfaces_in_components below.
         r = self.a.refine("be concise and technical", _ctx(constraints={"tone": "formal"}), ground=False)
         c = r["prompt_spec"]["constraints"]
         self.assertEqual(c["tone"], "formal")   # context overrides default neutral
         self.assertEqual(c["length"], "short")  # prompt overrides default medium
-        self.assertIn("technical", c["style"])  # prompt-inferred style
+
+    def test_prompt_inferred_style_surfaces_in_components(self):
+        # At the components level the spec-level default does not mask inference, so this
+        # actually guards _extract_constraints' style block: delete it and the 'with'
+        # case loses its style key and this fails.
+        with_style = self.a.analyze("write a technical breakdown", {})["components"]["constraints"]
+        self.assertEqual(with_style.get("style"), "concise, technical, no marketing")
+        without = self.a.analyze("write a breakdown of the data", {})["components"]["constraints"]
+        self.assertNotIn("style", without)
 
 
 class TestComponentExtraction(unittest.TestCase):
@@ -551,27 +588,45 @@ class TestCacheBehavior(unittest.TestCase):
             (Path(d) / name).mkdir()
             (Path(d) / name / "_combined.md").write_text(txt, encoding="utf-8")
 
+    @staticmethod
+    def _freeze_mtime(d, when=1700000000):
+        # Hold size (equal-length content) and mtime constant so the ONLY signature
+        # input left varying is the sha256 content digest. Without this, st_mtime_ns
+        # (bumped on every write) or st_size silently carries the test and the digest
+        # is never the discriminator it claims to guard.
+        for p in Path(d).glob("*/_combined.md"):
+            os.utime(p, (when, when))
+
     def test_signature_distinguishes_same_basename_books_by_content(self):
         with tempfile.TemporaryDirectory() as d:
+            # 11-byte contents, swapped below -> size identical before and after.
             self._mini_corpus(d, {"alpha": "aaa bbb ccc", "beta": "ddd eee fff"})
             c = BookCorpus(books_dir=d)
             paths = sorted(Path(d).glob("*/_combined.md"))
+            self._freeze_mtime(d)
             sig_before = c._signature(paths)
-            # Swap the two same-basename files' content: a basename-only key would collide.
+            # Swap the two same-basename files' content. Size and mtime held equal, so
+            # only the content digest can change the signature. Drop the digest from
+            # _signature and sig_before == sig_after -> this assertion fails.
             (Path(d) / "alpha" / "_combined.md").write_text("ddd eee fff", encoding="utf-8")
             (Path(d) / "beta" / "_combined.md").write_text("aaa bbb ccc", encoding="utf-8")
+            self._freeze_mtime(d)
             sig_after = c._signature(sorted(Path(d).glob("*/_combined.md")))
             self.assertNotEqual(sig_before, sig_after)
 
     def test_content_change_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as d:
-            self._mini_corpus(d, {"alpha": "one two three four five"})
-            n1 = BookCorpus(books_dir=d).build().num_chunks
-            (Path(d) / "alpha" / "_combined.md").write_text(
-                "one two three four five " * 200, encoding="utf-8"
-            )
-            n2 = BookCorpus(books_dir=d).build().num_chunks  # must not serve stale cache
-            self.assertNotEqual(n1, n2)
+            p = Path(d) / "alpha" / "_combined.md"
+            # 22-byte content; "omega" appears only after the edit.
+            self._mini_corpus(d, {"alpha": "alpha beta gamma delta"})
+            self._freeze_mtime(d)
+            c1 = BookCorpus(books_dir=d).build()
+            self.assertEqual(c1.search("omega", k=1), [])  # token absent in v1
+            # Same byte length (22) and same frozen mtime: only the digest differs.
+            p.write_text("alpha beta gamma omega", encoding="utf-8")
+            self._freeze_mtime(d)
+            c2 = BookCorpus(books_dir=d).build()  # must rebuild, not serve stale cache
+            self.assertTrue(c2.search("omega", k=1))  # fresh index sees the new token
 
     def test_corrupt_cache_rebuilds_silently(self):
         with tempfile.TemporaryDirectory() as d:
@@ -583,6 +638,64 @@ class TestCacheBehavior(unittest.TestCase):
             cache.write_text("{ not valid json ::::", encoding="utf-8")
             c2 = BookCorpus(books_dir=d).build()  # must not raise
             self.assertGreater(c2.num_chunks, 0)
+
+
+class TestSectionAwareExtractorRegressions(unittest.TestCase):
+    """Verification re-review #1: a human-written all-caps bracketed token in a RAW
+    prompt ([NOTE], [CONTEXT], ...) must not be mistaken for a rendered section
+    header. Section tracking only fires on the renderer's own labels; otherwise the
+    raw output-marker scan and the instruction-bullet scan are wrongly suppressed."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_bracket_token_does_not_hide_raw_output_contract(self):
+        p = (
+            "Process the data.\n[NOTE]\n"
+            "Return the answer as a JSON object with fixed keys.\n"
+            "Respond in valid JSON only."
+        )
+        self.assertIsNotNone(self.a._extract_output_format(p))
+        an = self.a.analyze(p, _ctx(constraints={"format": "json"}, risk_points=["compliance"]))
+        self.assertIsNotNone(an["components"]["output_format"])
+        self.assertFalse(any("compliance risk" in r.lower() for r in an["risk_assessment"]))
+        self.assertFalse(any("prompt does not" in i.lower() for i in an["issues"]))
+
+    def test_rendered_output_section_still_resolves(self):
+        rp = "[OUTPUT]\nReturn a single JSON object.\n[QUALITY CHECK]\nVerify the output format."
+        self.assertEqual(self.a._extract_output_format(rp), "Return a single JSON object.")
+
+    def test_bracket_token_does_not_hide_numbered_steps(self):
+        p = "Do the task.\n[NOTE]\n1. read the input\n2. extract entities\n3. return the result"
+        self.assertEqual(len(self.a._extract_instructions(p)), 3)
+
+
+class TestGoalMarkerStripRegression(unittest.TestCase):
+    """Verification re-review #3: the leading list-marker strip in _spec_goal must
+    remove only real marker shapes ('- ', '1. '), never eat the leading characters
+    of a genuine goal ('3D-render ...', '401k ...', '2FA ...')."""
+
+    def setUp(self):
+        self.a = PromptArchitect()
+
+    def test_leading_alphanumerics_preserved(self):
+        for g in (
+            "3D-render the scene from the input mesh.",
+            "401k contribution rules summary.",
+            "2FA bypass analysis for the login flow.",
+        ):
+            r = self.a.refine(g, {}, ground=False)
+            self.assertEqual(r["prompt_spec"]["goal"], g)
+
+    def test_real_list_marker_still_stripped(self):
+        self.assertEqual(
+            self.a.refine("- do the thing", {}, ground=False)["prompt_spec"]["goal"],
+            "do the thing",
+        )
+        self.assertEqual(
+            self.a.refine("1. do the thing", {}, ground=False)["prompt_spec"]["goal"],
+            "do the thing",
+        )
 
 
 class TestJSONSerializable(unittest.TestCase):

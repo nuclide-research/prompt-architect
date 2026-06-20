@@ -66,6 +66,14 @@ _QUALITY_MARKERS = (
     "double-check", "double check", "make sure", "ensure that", "self-check", "sanity check",
 )
 _EXAMPLE_MARKERS = ("example:", "for example", "e.g.", "few-shot", "example input", "example output")
+# The exact section labels the renderer emits (see the template in __init__).
+# Section tracking in the extractors keys off THIS set, not a bare [A-Z ]+ match,
+# so a human-written [NOTE]/[CONTEXT]/[DATA] token in a RAW prompt is never
+# mistaken for a rendered section header (which would otherwise suppress the raw
+# marker and bullet scans and drop the prompt's real output contract or steps).
+_RENDER_HEADERS = frozenset(
+    ("ROLE", "GOAL", "INPUTS", "INSTRUCTIONS", "OUTPUT", "CONSTRAINTS", "QUALITY CHECK")
+)
 # Imperative verbs that open an instruction step when prompts are written as prose.
 # Kept broad on purpose: goal extraction and the instruction fallback both key off
 # this set, so missing a common opener ("look at...", "pull out...") silently drops
@@ -359,7 +367,7 @@ class PromptArchitect:
         for line in self._lines(prompt):
             stripped = line.strip()
             header = re.match(r"^\[([A-Z ]+)\]$", stripped)
-            if header:
+            if header and header.group(1) in _RENDER_HEADERS:
                 non_instruction_section = header.group(1) not in ("INSTRUCTIONS",)
                 continue
             if non_instruction_section:
@@ -389,7 +397,7 @@ class PromptArchitect:
         for line in self._lines(prompt):
             stripped = line.strip()
             header = re.match(r"^\[([A-Z ]+)\]$", stripped)
-            if header:
+            if header and header.group(1) in _RENDER_HEADERS:
                 section = header.group(1)
                 continue
             if section == "OUTPUT":
@@ -572,10 +580,13 @@ class PromptArchitect:
         if components["goal"]:
             return components["goal"]
         # Last resort: synthesize one clear sentence from the prompt's first line.
-        # Strip any leading list marker so a bulleted first line ("- do the thing")
-        # does not become the rendered [GOAL] verbatim, matching _extract_goal.
+        # Strip a leading list marker so a bulleted first line ("- do the thing",
+        # "1. do the thing") does not become the rendered [GOAL] verbatim. Anchored
+        # to real marker shapes, NOT a character class: a char-class lstrip would
+        # eat meaningful leading alphanumerics from a real goal ("3D-render ...",
+        # "401k contribution rules ...", "2FA bypass ...").
         first = next((ln.strip() for ln in self._lines(prompt) if ln.strip()), "")
-        first = first.lstrip("- *0123456789.) ").strip()
+        first = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", first).strip()
         return first or "Complete the requested task accurately and completely."
 
     def _spec_inputs(self, components: PromptComponents, context: PromptContext) -> str:
