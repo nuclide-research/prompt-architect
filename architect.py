@@ -51,11 +51,38 @@ _QUALITY_MARKERS = (
 )
 _EXAMPLE_MARKERS = ("example:", "for example", "e.g.", "few-shot", "example input", "example output")
 # Imperative verbs that open an instruction step when prompts are written as prose.
+# Kept broad on purpose: goal extraction and the instruction fallback both key off
+# this set, so missing a common opener ("look at...", "pull out...") silently drops
+# the prompt's real intent. Recall matters more than precision here.
 _INSTRUCTION_VERBS = (
     "summarize", "analyze", "extract", "identify", "list", "generate", "write", "produce",
     "classify", "explain", "describe", "compare", "evaluate", "review", "find", "map",
     "rank", "translate", "convert", "validate", "check", "create", "compute",
+    # Common prompt openers the original set missed.
+    "look", "examine", "inspect", "scan", "detect", "flag", "parse", "pull", "gather",
+    "collect", "fetch", "retrieve", "audit", "assess", "monitor", "build", "design",
+    "refactor", "optimize", "debug", "test", "fix", "search", "enumerate", "discover",
+    "draft", "outline", "plan", "recommend", "suggest", "propose", "score", "label",
+    "tag", "transform", "normalize", "format", "render", "calculate", "count", "measure",
+    "sort", "filter", "group", "merge", "split", "report", "give", "tell", "show",
+    "determine", "categorize", "annotate", "redact", "highlight",
 )
+# Word-boundary lookup built from the same source: startswith() on the tuple is a
+# raw character-prefix test, so "scan"/"map"/"find"/"list" silently swallow
+# "Scanning"/"Mapping"/"Finding nemo"/"Listen". Match the first whitespace token
+# instead, stripping only trailing clause punctuation.
+_INSTRUCTION_VERB_SET = frozenset(_INSTRUCTION_VERBS)
+
+
+def _opens_with_instruction_verb(low: str) -> bool:
+    """True when the first whitespace token of `low` is an instruction verb.
+
+    Word-boundary replacement for `low.startswith(_INSTRUCTION_VERBS)`: keeps the
+    recall win (bare openers "look", "pull", "tell" still fire) while dropping
+    prefix false matches ("Scanning", "Finding", "Designers", "Reportedly").
+    """
+    head = low.split(None, 1)
+    return bool(head) and head[0].rstrip(",:;.!?") in _INSTRUCTION_VERB_SET
 
 
 class PromptArchitect:
@@ -206,29 +233,46 @@ class PromptArchitect:
         context: PromptContext,
         k: int,
     ) -> List[GroundingResult]:
-        """Retrieve supporting passages for the goal and each detected issue.
+        """Retrieve supporting passages for the refinement's prompt-engineering moves.
 
         Best-effort: if the corpus is missing, returns [] rather than raising, so
         refine() stays robust whether or not the books are present.
         """
-        # Distinct, de-duplicated queries: the goal plus each issue (bounded).
-        queries: List[str] = [spec["goal"]]
-        queries.extend(analysis["issues"][:3])
-        seen = set()
-        results: List[GroundingResult] = []
         try:
             corpus = self.corpus
         except (FileNotFoundError, ValueError):
             return []
-        for q in queries:
-            key = q.strip().lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
+        results: List[GroundingResult] = []
+        for q in self._grounding_queries(spec, analysis):
             passages = corpus.search(q, k=k)
             if passages:
                 results.append(GroundingResult(query=q, passages=passages))
         return results
+
+    @staticmethod
+    def _grounding_queries(spec: PromptSpec, analysis: PromptAnalysis) -> List[str]:
+        """Build prompt-engineering-topical retrieval queries (de-duplicated).
+
+        The book corpus is about prompt engineering, not the user's task domain, so
+        grounding on the raw goal text retrieves task-keyword matches (code, data)
+        instead of prompting guidance. Anchoring the goal query with a prompt-design
+        frame, and grounding on the detected issues (already prompt-eng-topical),
+        keeps retrieval on the books' actual subject.
+        """
+        queries: List[str] = []
+        goal = spec["goal"].strip().rstrip(".")
+        if goal and not goal.lower().startswith("complete the requested task"):
+            queries.append(
+                f"prompt engineering: how to structure an LLM prompt to {goal[:140]}"
+            )
+        queries.extend(analysis["issues"][:3])
+        seen, out = set(), []
+        for q in queries:
+            key = q.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(q)
+        return out
 
     # ------------------------------------------------------------------ #
     # Extraction helpers (analyze)
@@ -263,7 +307,7 @@ class PromptArchitect:
             return context["goal"]
         for sentence in self._sentences(prompt):
             low = sentence.lower().lstrip("- *0123456789.) ")
-            if low.startswith(_INSTRUCTION_VERBS):
+            if _opens_with_instruction_verb(low):
                 return sentence.strip()
         return None
 
@@ -433,11 +477,14 @@ class PromptArchitect:
     def _build_spec(
         self, prompt: str, components: PromptComponents, context: PromptContext
     ) -> PromptSpec:
+        # Resolve the goal once so the instruction fallback can reuse it instead of
+        # degrading to a literal "the task" when no goal was detected.
+        goal = self._spec_goal(prompt, components, context)
         return PromptSpec(
             role=self._spec_role(components, context),
-            goal=self._spec_goal(prompt, components, context),
+            goal=goal,
             inputs_contract=self._spec_inputs(components, context),
-            instructions=self._spec_instructions(components, context),
+            instructions=self._spec_instructions(components, context, goal),
             output_contract=self._spec_output(components, context),
             constraints=self._spec_constraints(components, context),
             quality_checks=self._spec_quality_checks(context),
@@ -494,15 +541,21 @@ class PromptArchitect:
         return templates.get(inputs_type, templates["mixed"])
 
     def _spec_instructions(
-        self, components: PromptComponents, context: PromptContext
+        self, components: PromptComponents, context: PromptContext, goal: str
     ) -> List[str]:
         if len(components["instructions"]) >= 2:
             # Normalize to a reasonable working set (2-7 steps; Cronin: split tasks).
             return [self._clean_step(s) for s in components["instructions"][:7]]
-        goal = context.get("goal") or (components["goal"] or "the task")
+        # Reuse the resolved goal; only fall back to a generic phrasing if it is empty
+        # or itself the generic placeholder (avoids "achieve: Complete the task...").
+        goal_text = goal.strip().rstrip(".")
+        if not goal_text or goal_text.lower().startswith("complete the requested task"):
+            core = "Perform the core work the task requires."
+        else:
+            core = f"Perform the core work required to achieve: {goal_text}."
         return [
             "Read the inputs carefully and extract the key entities, facts, and intent.",
-            f"Perform the core work required to achieve: {goal}.",
+            core,
             "Organize the result according to the OUTPUT contract below.",
         ]
 
@@ -614,14 +667,29 @@ class PromptArchitect:
 
     def _variant_cot(self, base: PromptSpec, context: PromptContext) -> Dict[str, Any]:
         spec = self._copy_spec(base)
-        spec["instructions"] = spec["instructions"] + [
-            "First, reason through the task step by step in an internal 'Reasoning' section. "
-            "Then summarize your conclusions in a 'Final Answer' section.",
-        ]
-        spec["output_contract"] = (
-            "Produce two sections: '## Reasoning' (your step-by-step working) followed by "
-            "'## Final Answer' (the conclusions only). " + base["output_contract"]
-        )
+        fmt = spec["constraints"].get("format", "").lower()
+        if fmt == "json":
+            # Expressing reasoning as markdown headings would contradict a JSON output
+            # contract; carry the reasoning as a JSON field instead.
+            spec["instructions"] = spec["instructions"] + [
+                "Reason through the task step by step, then place that reasoning in a top-level "
+                "\"reasoning\" array (one string per step) and put the conclusions in the "
+                "remaining result keys.",
+            ]
+            spec["output_contract"] = (
+                "Return a single JSON object with a top-level \"reasoning\" array (your "
+                "step-by-step working, one string per step) alongside the required result keys. "
+                "Keep all reasoning inside that array; emit no prose outside the JSON."
+            )
+        else:
+            spec["instructions"] = spec["instructions"] + [
+                "First, reason through the task step by step in a 'Reasoning' section. Then give "
+                "your conclusions in a 'Final Answer' section.",
+            ]
+            spec["output_contract"] = (
+                "Produce two sections: '## Reasoning' (your step-by-step working) followed by "
+                "'## Final Answer' (the conclusions only). " + base["output_contract"]
+            )
         spec["notes"] = base["notes"] + ["Variant: chain-of-thought emphasis."]
         return {
             "_id": "cot",
